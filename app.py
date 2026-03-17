@@ -1,21 +1,30 @@
 """
 AI Agent Architecture Demo — Streamlit
 Classroom tool for demonstrating how agent components work.
+Now built with LangChain 1.0: create_agent + @tool + InMemorySaver.
 
 Usage:
   1. pip install -r requirements.txt
-  2. set ANTHROPIC_API_KEY=your_key   (Windows) or export ANTHROPIC_API_KEY=...
+  2. set ANTHROPIC_API_KEY / OPENAI_API_KEY in .env
   3. streamlit run app.py
 """
 
 import os
 import re
-import json
+import uuid
 from datetime import date
+
 import streamlit as st
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from ddgs import DDGS
+
+# ── LangChain 1.0 imports ─────────────────────────────────────────────────────
+from langchain.agents import create_agent                  # replaces AgentExecutor / create_react_agent
+from langchain.tools import tool                           # @tool decorator
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+from langgraph.checkpoint.memory import InMemorySaver      # replaces ConversationBufferMemory
+from langchain_core.messages import AIMessage, ToolMessage, AIMessageChunk
 
 load_dotenv()
 
@@ -28,14 +37,26 @@ st.set_page_config(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-DEFAULT_SYSTEM_PROMPT_BASE = (
-    "You are 'Little L', a helpful assistant in a business school classroom "
-    "demo about AI agent architecture."
-)
+DEFAULT_SYSTEM_PROMPT_BASE = """\
+You are Little L — a sharp, no-BS business AI built for Goizueta Business School students.
 
+**Identity:** You think like a McKinsey analyst meets a startup founder. You cut through noise, \
+lead with insight, and back claims with data.
+
+**Personality:** Direct, confident, and occasionally witty. You respect the student's time. \
+No filler phrases ("Great question!"), no hedging. Say it once, say it well.
+
+**Tone:** Professional but energetic — think boardroom ready with a espresso shot. \
+You engage with real-world business context: markets, strategy, ops, finance.
+
+**Style:** Bullet points over walls of text. Lead with the answer, follow with reasoning. \
+Use concrete numbers and examples whenever possible.\
+"""
+
+# (provider, model_id) pairs — used with langchain_openai / langchain_anthropic
 MODELS = {
-    "Haiku 4.5 (fast)": "claude-haiku-4-5-20251001",
-    "GPT-3.5 Turbo": "gpt-3.5-turbo",
+    "Haiku 4.5 (fast)": ("anthropic", "claude-haiku-4-5-20251001"),
+    "GPT-3.5 Turbo":    ("openai",    "gpt-3.5-turbo"),
 }
 
 KNOWLEDGE_BASE = [
@@ -54,8 +75,8 @@ KNOWLEDGE_BASE = [
         "title": "Shipping Information",
         "content": (
             "Standard shipping takes 3–5 business days. "
-            "Express shipping (1–2 days) is available for an additional \$15. "
-            "Free shipping on all orders over \$75."
+            "Express shipping (1–2 days) is available for an additional $15. "
+            "Free shipping on all orders over $75."
         ),
         "keywords": ["shipping", "delivery", "ship", "express", "how long"],
     },
@@ -74,130 +95,51 @@ KNOWLEDGE_BASE = [
         "title": "Pricing & Plans",
         "content": (
             "Free tier: 1,000 requests/month. "
-            "Startup plan: \$99/month. "
-            "Enterprise plan: \$499/month. "
+            "Startup plan: $99/month. "
+            "Enterprise plan: $499/month. "
             "Annual billing saves 20%."
         ),
         "keywords": ["pricing", "price", "plan", "cost", "enterprise", "startup", "free tier"],
     },
 ]
 
-# ── Tool schemas ──────────────────────────────────────────────────────────────
-def _web_search_description() -> str:
-    today = date.today().strftime("%B %d, %Y")
-    return (
-        f"Search the internet for current information, news, weather, or any real-time data. "
-        f"Today's date is {today}. When the user asks about today's news or current events, "
-        f"include the current date in the query (e.g. 'news {today}')."
-    )
-
-
-_CALCULATOR_OPENAI = {
-    "type": "function",
-    "function": {
-        "name": "calculator",
-        "description": "Evaluate a mathematical expression precisely. Use this for any arithmetic calculation.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "The math expression to evaluate, e.g. '847 * 293'",
-                },
-            },
-            "required": ["expression"],
-        },
-    },
-}
-
-_CALCULATOR_ANTHROPIC = {
-    "name": "calculator",
-    "description": "Evaluate a mathematical expression precisely. Use this for any arithmetic calculation.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "expression": {
-                "type": "string",
-                "description": "The math expression to evaluate, e.g. '847 * 293'",
-            },
-        },
-        "required": ["expression"],
-    },
-}
-
-
-def build_openai_tools() -> list[dict]:
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": _web_search_description(),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "The search query string"},
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        _CALCULATOR_OPENAI,
-    ]
-
-
-def build_anthropic_tools() -> list[dict]:
-    return [
-        {
-            "name": "web_search",
-            "description": _web_search_description(),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query string"},
-                },
-                "required": ["query"],
-            },
-        },
-        _CALCULATOR_ANTHROPIC,
-    ]
-
 SUGGESTED = [
     ("What did I just ask you?",                   "🧠", "Tests Memory — try OFF then ON"),
     ("What's 847 × 293?",                          "🔢", "Tests Tools — single tool call"),
     ("What's the refund policy?",                  "📚", "Tests RAG — try OFF then ON"),
-    ("How much Bitcoin would \$1000 buy today?",    "₿",  "Tests Tools — search then calculate"),
+    ("How much Bitcoin would $1000 buy today?",    "₿",  "Tests Tools — agent chains search + calculate"),
 ]
 
-# ── Session state defaults ────────────────────────────────────────────────────
-for k, v in {
-    "messages": [],
-    "token_count": 0,
-    "last_trace": [],
-    "last_system_prompt": "",
-    "last_rag_docs": [],
-    "use_memory": False,
-    "use_tools": False,
-    "use_rag": False,
-    "use_workflow": False,
-    "last_web_results": [],
-    "use_system_prompt": False,
-    "system_prompt_base": DEFAULT_SYSTEM_PROMPT_BASE,
-    "model_label": "GPT-3.5 Turbo",
-    "max_tokens": 1,
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# ── Core helpers ──────────────────────────────────────────────────────────────
-
-def rag_retrieve(query: str) -> list[dict]:
-    q = query.lower()
-    return [d for d in KNOWLEDGE_BASE if any(kw in q for kw in d["keywords"])]
+# ── Module-level web search cache (query → results) ───────────────────────────
+# Allows @tool functions to share structured results with the Streamlit layer
+_search_cache: dict[str, list[dict]] = {}
 
 
-def calculate(expression: str) -> str:
-    """Safely evaluate a math expression. Returns the result as a string."""
+def _get_chunk_text(chunk) -> str:
+    """
+    Extract plain text from an AIMessageChunk.
+    Handles both str content (OpenAI) and list-of-blocks content (Anthropic).
+    """
+    c = chunk.content
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "".join(
+            b.get("text", "") for b in c
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+# ── Tool definitions (@tool replaces schema dicts) ────────────────────────────
+
+@tool
+def calculator(expression: str) -> str:
+    """
+    Evaluate a mathematical expression precisely.
+    Use this for any arithmetic calculation.
+    Examples: '847 * 293', '(12 + 8) / 5', '1000 / 42153.50'
+    """
     expr = (expression
             .replace("×", "*").replace("÷", "/")
             .replace("−", "-").replace("^", "**"))
@@ -210,10 +152,13 @@ def calculate(expression: str) -> str:
         return f"Error: {exc}"
 
 
-def web_search(query: str, max_results: int = 4) -> list[dict]:
-    """Execute a web search. For news-like queries uses ddgs.news(), otherwise ddgs.text()."""
+def _do_web_search(query: str, max_results: int = 4) -> list[dict]:
+    """Execute a web search using DuckDuckGo. Returns list of result dicts."""
     q = query.lower()
-    is_news = any(w in q for w in ["news", "today", "recent", "latest", "current events", "what happened", "who won"])
+    is_news = any(w in q for w in [
+        "news", "today", "recent", "latest", "current events",
+        "what happened", "who won",
+    ])
     try:
         with DDGS() as ddgs:
             if is_news:
@@ -234,7 +179,7 @@ def web_search(query: str, max_results: int = 4) -> list[dict]:
         return []
 
 
-def format_search_results(results: list[dict]) -> str:
+def _format_search_results(results: list[dict]) -> str:
     """Serialize web search results into a string for tool result messages."""
     if not results:
         return "No results found."
@@ -245,13 +190,67 @@ def format_search_results(results: list[dict]) -> str:
     )
 
 
-def build_persona() -> str:
-    """Persona + constraints block. Returns empty string when system prompt toggle is OFF."""
-    if not st.session_state.use_system_prompt:
-        return ""
+@tool
+def web_search(query: str) -> str:
+    """
+    Search the internet for current information, news, weather, or any real-time data.
+    Use when the user asks about today's news, current events, live prices, or
+    anything requiring up-to-date information beyond training knowledge.
+    Include today's date in the query when relevant.
+    """
+    today = date.today().strftime("%B %d, %Y")
+    full_query = query if any(d in query for d in ["2025", "2026", today[:4]]) else query
+    results = _do_web_search(full_query)
+    _search_cache[query] = results          # store for inspector panel
+    return _format_search_results(results)
+
+
+# ── Session state defaults ────────────────────────────────────────────────────
+for k, v in {
+    "messages": [],
+    "token_count": 0,
+    "last_trace": [],
+    "last_system_prompt": "",
+    "last_rag_docs": [],
+    "use_memory": False,
+    "use_tools": False,
+    "use_rag": False,
+    "last_web_results": [],
+    "use_system_prompt": False,
+    "system_prompt_base": DEFAULT_SYSTEM_PROMPT_BASE,
+    "model_label": "GPT-3.5 Turbo",
+    "max_tokens": 1,
+    # LangChain 1.0: persistent checkpointer & stable session thread_id
+    "checkpointer": InMemorySaver(),
+    "session_thread_id": str(uuid.uuid4()),
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ── Core helpers ──────────────────────────────────────────────────────────────
+
+def rag_retrieve(query: str) -> list[dict]:
+    q = query.lower()
+    return [d for d in KNOWLEDGE_BASE if any(kw in q for kw in d["keywords"])]
+
+
+def build_system_prompt(rag_docs: list[dict]) -> str:
+    """
+    Build the full system prompt for this request.
+    Combines persona/constraints (from build_persona) with injected context
+    (RAG docs, memory notice, tool instructions) — single function replaces
+    the previous build_persona() + build_context() pair.
+    Returns empty string when System Prompt toggle is OFF.
+    """
     s = st.session_state
+
+    if not s.use_system_prompt:
+        return ""
+
     parts = [s.system_prompt_base]
     constraints = []
+
     if not s.use_memory:
         constraints.append(
             "You have NO memory of previous turns. You only see the current message. "
@@ -269,13 +268,6 @@ def build_persona() -> str:
         )
     if constraints:
         parts.append("\n\n## Constraints\n" + "\n".join(f"- {c}" for c in constraints))
-    return "".join(parts)
-
-
-def build_context(history: list[dict], rag_docs: list[dict]) -> str:
-    """Injected data block (RAG, memory, tool instructions). Always built when toggles are ON."""
-    s = st.session_state
-    parts: list[str] = []
 
     if s.use_rag:
         if rag_docs:
@@ -289,41 +281,47 @@ def build_context(history: list[dict], rag_docs: list[dict]) -> str:
                 "\n\n(RAG is enabled but no relevant documents were retrieved for this query.)"
             )
 
-    if s.use_memory and history:
-        hist_text = "\n".join(
-            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
-            for m in history[-6:]
-        )
-        parts.append(
-            f"\n\n## Conversation History (last {min(len(history), 6)} turns)\n{hist_text}"
-        )
-
-    if s.use_tools:
-        parts.append(
-            "\n\n## Calculator\n"
-            "- **calculator(expression)**: Evaluate math precisely. "
-            "Say 'Calculating: [expr] = [result]' when using it."
-        )
-
-    if s.use_workflow:
-        parts.append(
-            "\n\n## Multi-step Workflow\n"
-            "When a question requires real-world data AND a calculation (e.g. 'how much X can I buy for $Y today?'), "
-            "first call web_search to get the current value, then call calculator with the result. "
-            "For pure arithmetic, call calculator directly."
-        )
-
     return "".join(parts)
+
+
+def build_agent(system_prompt: str):
+    """
+    Build a LangChain 1.0 agent using create_agent.
+
+    LangChain 1.0 API (from langchain.agents):
+      - model object  → model parameter
+      - system_prompt → system_prompt parameter
+      - tools list    → tools parameter
+      - checkpointer  → checkpointer parameter (InMemorySaver)
+    """
+    s = st.session_state
+    provider, model_id = MODELS[s.model_label]
+
+    max_tok = max(s.max_tokens, 256) if s.use_tools else s.max_tokens
+
+    if provider == "openai":
+        model = ChatOpenAI(model=model_id, max_tokens=max_tok)
+    else:
+        model = ChatAnthropic(model=model_id, max_tokens=max_tok)
+
+    tools_list = [web_search, calculator] if s.use_tools else []
+
+    return create_agent(
+        model=model,
+        tools=tools_list,
+        system_prompt=system_prompt if system_prompt else None,
+        checkpointer=s.checkpointer,
+    )
 
 
 def build_trace(
     user_msg: str,
     rag_docs: list[dict],
-    tool_calls: list[dict] | None = None,
+    tool_calls_list: list[dict] | None = None,
 ) -> list[dict]:
-    """Return trace steps. tool_calls is the list of tool executions from the agentic loop."""
+    """Return trace steps for the inspector panel."""
     s = st.session_state
-    tool_calls = tool_calls or []
+    tool_calls_list = tool_calls_list or []
     msg = user_msg.lower()
     steps: list[dict] = []
 
@@ -340,13 +338,6 @@ def build_trace(
     steps.append({"type": "user", "icon": "👤", "label": "User Input",
                   "text": display_msg, "details": []})
 
-    # ── Workflow hint (shown before LLM call when workflow toggle is ON) ────────
-    if s.use_workflow and tool_calls:
-        route = " → ".join(tci["name"] for tci in tool_calls)
-        steps.append({"type": "workflow", "icon": "⚡", "label": "Workflow",
-                      "text": f"Multi-step plan: {route}", "details": []})
-
-    # ── Pre-LLM context gathering ─────────────────────────────────────────────
     if not s.use_memory and is_mem_q:
         steps.append({"type": "warning", "icon": "❌", "label": "Memory OFF",
                       "text": "Agent cannot recall prior messages", "details": []})
@@ -367,7 +358,6 @@ def build_trace(
         steps.append({"type": "warning", "icon": "❌", "label": "Tools OFF",
                       "text": "Cannot search the web for current information", "details": []})
 
-    # ── LLM Call #1 ──────────────────────────────────────────────────────────
     llm1_details: list[tuple[str, str]] = []
     if s.use_system_prompt:
         llm1_details.append(("📋", "System Prompt: persona + constraints"))
@@ -380,14 +370,12 @@ def build_trace(
         llm1_details.append(("🔧", "Tools available: web_search, calculator"))
     llm1_details.append(("👤", f"User: {display_msg}"))
 
-    # Label the first LLM call — numbered only when tool calls follow
-    llm1_label = "LLM Call #1" if tool_calls else "LLM Call"
+    llm1_label = "LLM Call #1" if tool_calls_list else "LLM Call"
     steps.append({"type": "llm", "icon": "🤖", "label": llm1_label,
-                  "text": "Decides whether to call a tool" if tool_calls else "",
+                  "text": "Decides whether to call a tool" if tool_calls_list else "",
                   "details": llm1_details})
 
-    # ── Interleaved tool executions + follow-up LLM calls ────────────────────
-    for idx, tci in enumerate(tool_calls):
+    for idx, tci in enumerate(tool_calls_list):
         is_calc = tci["name"] == "calculator"
         if is_calc:
             result_details = [("=", tci.get("calc_result", ""))]
@@ -406,7 +394,7 @@ def build_trace(
                       "text": f'{arg_label}: "{tci["query"]}"',
                       "details": result_details})
         next_llm_num = idx + 2
-        is_last_tool = idx == len(tool_calls) - 1
+        is_last_tool = idx == len(tool_calls_list) - 1
         steps.append({"type": "llm", "icon": "🤖",
                       "label": f"LLM Call #{next_llm_num}",
                       "text": "Generates final answer" if is_last_tool else "Decides next step",
@@ -419,22 +407,22 @@ def build_trace(
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        st.markdown("# 🤖 Agent Demo")
-    with c2:
-        st.metric("Tokens", f"{st.session_state.token_count:,}")
+    st.markdown("# 🤖 Agent Demo")
     st.caption("Toggle components to see how the agent's behavior changes in real time.")
 
     st.session_state.model_label = st.selectbox(
         "Model", list(MODELS.keys()), index=list(MODELS.keys()).index(st.session_state.model_label)
     )
-    st.session_state.max_tokens = st.slider(
-        "Max tokens to generate", min_value=1, max_value=1024,
-        value=st.session_state.max_tokens, step=1,
-        help="Caps the length of the response. Lower = shorter answers and faster responses.",
-    )
-    st.caption(f"~{st.session_state.max_tokens // 4 * 3} words max")
+    tok_col, slider_col = st.columns([1, 2])
+    with tok_col:
+        st.metric("Tokens used", f"{st.session_state.token_count:,}")
+    with slider_col:
+        st.session_state.max_tokens = st.slider(
+            "Max tokens", min_value=1, max_value=1024,
+            value=st.session_state.max_tokens, step=1,
+            help="Caps the length of the response. Lower = shorter answers and faster responses.",
+        )
+        st.caption(f"~{st.session_state.max_tokens // 4 * 3} words max")
 
     st.toggle("📋 System Prompt", key="use_system_prompt")
     st.caption(
@@ -458,13 +446,13 @@ with st.sidebar:
 
     st.toggle("🧠 Memory", key="use_memory")
     st.caption(
-        "✅ History injected into each prompt" if st.session_state.use_memory
+        "✅ Conversation persists via LangGraph MemorySaver" if st.session_state.use_memory
         else "🚫 Agent forgets after every single message"
     )
 
     st.toggle("🔧 Tools", key="use_tools")
     st.caption(
-        "✅ Web search + calculator via Function Calling" if st.session_state.use_tools
+        "✅ Web search + calculator via @tool + create_agent" if st.session_state.use_tools
         else "🚫 Limited to training knowledge only"
     )
 
@@ -489,12 +477,6 @@ with st.sidebar:
                 st.caption(f"Keywords: {', '.join(doc['keywords'])}")
                 st.markdown("---")
 
-    st.toggle("⚡ Workflow Logic", key="use_workflow")
-    st.caption(
-        "✅ Multi-step plan shown: search → calculator when needed" if st.session_state.use_workflow
-        else "🚫 No workflow guidance — LLM decides on its own"
-    )
-
     if st.button("↺ Reset", use_container_width=True):
         st.session_state.messages = []
         st.session_state.token_count = 0
@@ -502,6 +484,9 @@ with st.sidebar:
         st.session_state.last_system_prompt = ""
         st.session_state.last_rag_docs = []
         st.session_state.last_web_results = []
+        # New session: fresh thread_id + fresh checkpointer
+        st.session_state.checkpointer = InMemorySaver()
+        st.session_state.session_thread_id = str(uuid.uuid4())
         st.rerun()
 
 # ── Page header ───────────────────────────────────────────────────────────────
@@ -510,7 +495,7 @@ st.markdown("## 🤖 AI Agent Architecture — Live Demo")
 active = [
     label for label, key in [
         ("🧠 Memory", "use_memory"), ("🔧 Tools", "use_tools"),
-        ("📚 RAG", "use_rag"), ("⚡ Workflow", "use_workflow"),
+        ("📚 RAG", "use_rag"),
     ]
     if st.session_state[key]
 ]
@@ -528,7 +513,6 @@ with col_inspector:
     st.markdown("### 🔍 Under the Hood")
 
     with st.container():
-        # Clear stale traces from older app versions (non-dict format)
         if st.session_state.last_trace and not isinstance(st.session_state.last_trace[0], dict):
             st.session_state.last_trace = []
 
@@ -537,7 +521,6 @@ with col_inspector:
                 "user":    "#6c757d",
                 "llm":     "#0d6efd",
                 "tool":    "#fd7e14",
-                "workflow":"#e6a817",
                 "output":  "#198754",
                 "warning": "#dc3545",
             }
@@ -589,7 +572,7 @@ with col_inspector:
                 "**What you'll see:**\n"
                 "- User → LLM → Tool → LLM → Output flow\n"
                 "- Each LLM call shows exactly what was in the prompt\n"
-                "- Workflow bypasses and missing-component warnings"
+                "- Missing-component warnings when toggles are OFF"
             )
 
 
@@ -606,15 +589,13 @@ with col_chat:
 
     st.divider()
 
-    # Render existing history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Placeholder where streaming output will appear
     stream_slot = st.empty()
 
-# ── Chat input (Streamlit always renders this at page bottom) ─────────────────
+# ── Chat input ────────────────────────────────────────────────────────────────
 prompt = st.chat_input("Ask Little L anything...")
 
 if "_pending_q" in st.session_state:
@@ -623,180 +604,136 @@ if "_pending_q" in st.session_state:
 # ── Process input ─────────────────────────────────────────────────────────────
 if prompt:
     rag_docs = rag_retrieve(prompt) if st.session_state.use_rag else []
-    history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
-    system_prompt = (build_persona() + build_context(history, rag_docs)).strip()
+    system_prompt = build_system_prompt(rag_docs)
 
-    if st.session_state.use_memory:
-        api_messages = [
-            {"role": m["role"], "content": m["content"]}
-            for m in st.session_state.messages[-6:]
-        ]
-    else:
-        api_messages = []
-    api_messages.append({"role": "user", "content": prompt})
+    # ── Memory: LangGraph MemorySaver + thread_id ─────────────────────────────
+    # Memory ON  → reuse the same session thread_id (agent remembers history)
+    # Memory OFF → new UUID each request (agent starts fresh every turn)
+    thread_id = (
+        st.session_state.session_thread_id
+        if st.session_state.use_memory
+        else str(uuid.uuid4())
+    )
+    config = {"configurable": {"thread_id": thread_id}}
 
-    input_tokens = len(system_prompt) // 4 + sum(len(m["content"]) // 4 for m in api_messages)
+    agent = build_agent(system_prompt)
 
-    model_id = MODELS[st.session_state.model_label]
-    is_openai = model_id.startswith("gpt")
+    tool_calls_list: list[dict] = []
+    full_response = ""
 
-    # These are populated during the API interaction below
-    tool_calls_list: list[dict] = []   # one entry per tool execution
-    full_response: str = ""
+    input_tokens = len(system_prompt) // 4 + len(prompt) // 4
+
+    provider, _ = MODELS[st.session_state.model_label]
+
+    api_key_var = "ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY"
+    api_key = os.environ.get(api_key_var, "")
 
     with stream_slot.container():
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
+            if not api_key:
+                full_response = f"⚠️ {api_key_var} not set. Add it to .env and restart."
+                st.error(full_response)
+            else:
+                try:
+                    # ── LangChain 1.0 streaming ───────────────────────────────
+                    # agent.stream(stream_mode="messages") yields (chunk, metadata)
+                    # tuples — AIMessageChunks for text/tool decisions,
+                    # ToolMessages for tool results.
+                    response_placeholder = st.empty()
+                    status_placeholder = st.empty()
 
-            if is_openai:
-                openai_key = os.environ.get("OPENAI_API_KEY", "")
-                if not openai_key:
-                    full_response = "⚠️ OPENAI_API_KEY not set. Set it and restart."
-                    st.error(full_response)
-                else:
-                    try:
-                        from openai import OpenAI
-                        oa_client = OpenAI(api_key=openai_key)
-                        oai_messages = []
-                        if system_prompt:
-                            oai_messages.append({"role": "system", "content": system_prompt})
-                        oai_messages.extend(api_messages)
+                    # Track active tool calls (tool call id → tool name string)
+                    pending_tool_map: dict[str, str] = {}
 
-                        if st.session_state.use_tools:
-                            # Agentic tool loop — LLM calls tools until it's ready to answer
-                            for _round in range(6):
-                                r = oa_client.chat.completions.create(
-                                    model=model_id,
-                                    messages=oai_messages,
-                                    tools=build_openai_tools(),
-                                    tool_choice="auto",
-                                    max_tokens=max(st.session_state.max_tokens, 256),
-                                )
-                                msg = r.choices[0].message
-                                if not msg.tool_calls:
-                                    full_response = msg.content or ""
-                                    break
-                                oai_messages.append(msg)
+                    # ── LangChain 1.0: agent.stream(stream_mode="messages") ──────
+                    # Each iteration yields (chunk, metadata).
+                    # AIMessageChunk: either text tokens (final response) or a
+                    #   tool-call start signal. Args are streamed as partial_json
+                    #   content blocks (not in chunk.tool_calls), so we use
+                    #   agent.get_state() after streaming for complete args.
+                    # ToolMessage: tool finished — show status.
+                    for chunk, metadata in agent.stream(
+                        {"messages": [{"role": "user", "content": prompt}]},
+                        config=config,
+                        stream_mode="messages",
+                    ):
+                        if isinstance(chunk, AIMessageChunk):
+                            if chunk.tool_calls:
+                                # First chunk of a tool call — name is available here
+                                for tc in chunk.tool_calls:
+                                    if tc.get("id") and tc.get("name"):
+                                        pending_tool_map[tc["id"]] = tc["name"]
+                                        status_placeholder.markdown(
+                                            f"🔧 Calling **{tc['name']}**..."
+                                        )
+                            else:
+                                # Text response tokens.
+                                # _get_chunk_text handles str (OpenAI) and
+                                # list-of-content-blocks (Anthropic).
+                                text = _get_chunk_text(chunk)
+                                if text:
+                                    full_response += text
+                                    response_placeholder.markdown(full_response + "▌")
+
+                        elif isinstance(chunk, ToolMessage):
+                            status_placeholder.markdown(
+                                f"🔧 **{pending_tool_map.get(chunk.tool_call_id, 'tool')}** "
+                                "done — processing result..."
+                            )
+
+                    # After streaming: use get_state() to get complete tool args
+                    # (args stream as partial_json blocks; only full state has them)
+                    if pending_tool_map and st.session_state.use_tools:
+                        final_state = agent.get_state(config)
+                        tool_call_id_to_args: dict[str, dict] = {}
+                        tool_call_id_to_result: dict[str, str] = {}
+
+                        for msg in final_state.values.get("messages", []):
+                            if isinstance(msg, AIMessage) and msg.tool_calls:
                                 for tc in msg.tool_calls:
-                                    args = json.loads(tc.function.arguments)
-                                    if tc.function.name == "calculator":
-                                        expr = args.get("expression", "")
-                                        result = calculate(expr)
-                                        tci = {"name": "calculator", "query": expr,
-                                               "calc_result": result, "web_results": []}
-                                        tool_result_content = result
-                                    else:
-                                        query = args.get("query", "")
-                                        with st.spinner(f'🔍 Searching: "{query}"...'):
-                                            wr = web_search(query)
-                                        tci = {"name": tc.function.name, "query": query,
-                                               "calc_result": "", "web_results": wr}
-                                        tool_result_content = format_search_results(wr)
-                                    tool_calls_list.append(tci)
-                                    oai_messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": tc.id,
-                                        "content": tool_result_content,
-                                    })
+                                    tool_call_id_to_args[tc["id"]] = {
+                                        "name": tc["name"],
+                                        "args": tc.get("args", {}),
+                                    }
+                            elif isinstance(msg, ToolMessage):
+                                tool_call_id_to_result[msg.tool_call_id] = msg.content
 
-                        if not full_response:
-                            # Final streaming answer (tools done or tools disabled)
-                            def response_generator():
-                                stream = oa_client.chat.completions.create(
-                                    model=model_id,
-                                    messages=oai_messages,
-                                    max_tokens=st.session_state.max_tokens,
-                                    stream=True,
-                                )
-                                for chunk in stream:
-                                    delta = chunk.choices[0].delta.content
-                                    if delta:
-                                        yield delta
-                            full_response = st.write_stream(response_generator())
-                        else:
-                            st.markdown(full_response)
-                    except Exception as exc:
-                        full_response = f"⚠️ API error: {exc}"
-                        st.error(full_response)
+                        for tc_id, tc_info in tool_call_id_to_args.items():
+                            name = tc_info["name"]
+                            args = tc_info["args"]
+                            result = tool_call_id_to_result.get(tc_id, "")
+                            if name == "calculator":
+                                tool_calls_list.append({
+                                    "name": "calculator",
+                                    "query": args.get("expression", ""),
+                                    "calc_result": result,
+                                    "web_results": [],
+                                })
+                            elif name == "web_search":
+                                query_str = args.get("query", "")
+                                tool_calls_list.append({
+                                    "name": "web_search",
+                                    "query": query_str,
+                                    "calc_result": "",
+                                    "web_results": _search_cache.get(query_str, []),
+                                })
 
-            else:  # Anthropic
-                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-                if not api_key:
-                    full_response = "⚠️ ANTHROPIC_API_KEY not set. Set it and restart."
+                    # Finalize display
+                    status_placeholder.empty()
+                    if full_response:
+                        response_placeholder.markdown(full_response)
+                    else:
+                        full_response = "*(no response)*"
+                        response_placeholder.markdown(full_response)
+
+                except Exception as exc:
+                    full_response = f"⚠️ API error: {exc}"
                     st.error(full_response)
-                else:
-                    try:
-                        client = Anthropic(api_key=api_key)
-                        anth_messages = list(api_messages)
 
-                        if st.session_state.use_tools:
-                            # Agentic tool loop — LLM calls tools until it's ready to answer
-                            for _round in range(6):
-                                kwargs_loop: dict = dict(
-                                    model=model_id,
-                                    messages=anth_messages,
-                                    tools=build_anthropic_tools(),
-                                    max_tokens=max(st.session_state.max_tokens, 256),
-                                )
-                                if system_prompt:
-                                    kwargs_loop["system"] = system_prompt
-                                r = client.messages.create(**kwargs_loop)
-                                if r.stop_reason != "tool_use":
-                                    full_response = next(
-                                        (b.text for b in r.content if hasattr(b, "text")), ""
-                                    )
-                                    break
-                                tool_results = []
-                                anth_messages = anth_messages + [
-                                    {"role": "assistant", "content": r.content}
-                                ]
-                                for tu in (b for b in r.content if b.type == "tool_use"):
-                                    if tu.name == "calculator":
-                                        expr = tu.input.get("expression", "")
-                                        result = calculate(expr)
-                                        tci = {"name": "calculator", "query": expr,
-                                               "calc_result": result, "web_results": []}
-                                        tool_result_content = result
-                                    else:
-                                        query = tu.input.get("query", "")
-                                        with st.spinner(f'🔍 Searching: "{query}"...'):
-                                            wr = web_search(query)
-                                        tci = {"name": tu.name, "query": query,
-                                               "calc_result": "", "web_results": wr}
-                                        tool_result_content = format_search_results(wr)
-                                    tool_calls_list.append(tci)
-                                    tool_results.append({
-                                        "type": "tool_result",
-                                        "tool_use_id": tu.id,
-                                        "content": tool_result_content,
-                                    })
-                                anth_messages = anth_messages + [
-                                    {"role": "user", "content": tool_results}
-                                ]
-
-                        if not full_response:
-                            # Final streaming answer (tools done or tools disabled)
-                            def response_generator():
-                                kwargs2: dict = dict(
-                                    model=model_id,
-                                    messages=anth_messages,
-                                    max_tokens=st.session_state.max_tokens,
-                                )
-                                if system_prompt:
-                                    kwargs2["system"] = system_prompt
-                                with client.messages.stream(**kwargs2) as stream:
-                                    for text in stream.text_stream:
-                                        yield text
-                            full_response = st.write_stream(response_generator())
-                        else:
-                            st.markdown(full_response)
-                    except Exception as exc:
-                        full_response = f"⚠️ API error: {exc}"
-                        st.error(full_response)
-
-    # Build trace with actual results after the interaction
+    # Build trace with actual tool call data
     trace = build_trace(prompt, rag_docs, tool_calls_list)
     st.session_state.last_trace = trace
     st.session_state.last_system_prompt = system_prompt
